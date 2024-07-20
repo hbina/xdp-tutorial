@@ -19,12 +19,24 @@
 #include <xdp/libxdp.h>
 #include <xdp/xsk.h>
 
+#define __USE_MISC 1
+
 #include <arpa/inet.h>
-#include <linux/icmpv6.h>
-#include <linux/if_ether.h>
-#include <linux/if_link.h>
-#include <linux/ipv6.h>
-#include <net/if.h>
+// #include <net/if_arp.h>
+#include <netinet/icmp6.h>
+#include <netinet/if_ether.h>
+#include <netinet/ip.h>
+#include <netinet/ip6.h>
+#include <netinet/ip_icmp.h>
+#include <netinet/tcp.h>
+// #include <linux/icmp.h>
+// #include <linux/icmpv6.h>
+// #include <linux/if.h>
+// #include <linux/if_ether.h>
+// #include <linux/if_link.h>
+// #include <linux/ip.h>
+// #include <linux/ipv6.h>
+// #include <net/if.h>
 
 #include "../common/common_libbpf.h"
 #include "../common/common_params.h"
@@ -243,81 +255,469 @@ static void complete_tx(struct xsk_socket_info *xsk) {
   }
 }
 
-static inline __sum16 csum16_add(__sum16 csum, __be16 addend) {
-  uint16_t res = (uint16_t)csum;
+static inline uint16_t calculate_internet_checksum(uint8_t *addr,
+                                                   uint32_t count) {
+  uint32_t sum = 0;
 
-  res += (__u16)addend;
-  return (__sum16)(res + (res < (__u16)addend));
+  int iter = 0;
+  while (count > 1) {
+    uint16_t *addr16 = (uint16_t *)addr;
+    sum = sum + *(addr16 + iter);
+    count = count - 2;
+    iter = iter + 1;
+  }
+
+  if (count > 0) {
+    sum = sum + *(addr + (iter * 2));
+  }
+
+  while (sum >> 16) {
+    sum = (sum & 0xFFFF) + (sum >> 16);
+  }
+
+  return (~sum);
 }
 
-static inline __sum16 csum16_sub(__sum16 csum, __be16 addend) {
-  return csum16_add(csum, ~addend);
+static bool process_icmp_v6(struct xsk_socket_info *xsk, uint64_t addr,
+                            uint32_t len) {
+  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+  if (len < (sizeof(struct ethhdr) + sizeof(struct ip6_hdr) +
+             sizeof(struct icmp6_hdr))) {
+    return false;
+  }
+
+  struct ethhdr *eth = (struct ethhdr *)pkt;
+  struct ip6_hdr *ipv6 = (struct ip6_hdr *)(eth + 1);
+  struct icmp6_hdr *icmp = (struct icmp6_hdr *)(ipv6 + 1);
+
+  if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
+      ipv6->ip6_ctlun.ip6_un1.ip6_un1_nxt != IPPROTO_ICMPV6 ||
+      icmp->icmp6_type != ICMP6_ECHO_REQUEST) {
+    return false;
+  }
+
+  printf("ICMP6 <<<<<<<<<<<<<<<<\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "ipv6_proto:0x%X\n"
+         "icmp_proto:0x%X\n",
+         ntohs(eth->h_proto),                 //
+         eth->h_dest[0],                      //
+         eth->h_dest[1],                      //
+         eth->h_dest[2],                      //
+         eth->h_dest[3],                      //
+         eth->h_dest[4],                      //
+         eth->h_dest[5],                      //
+         eth->h_source[0],                    //
+         eth->h_source[1],                    //
+         eth->h_source[2],                    //
+         eth->h_source[3],                    //
+         eth->h_source[4],                    //
+         eth->h_source[5],                    //
+         ipv6->ip6_ctlun.ip6_un1.ip6_un1_nxt, //
+         icmp->icmp6_type                     //
+  );
+
+  uint8_t tmp_mac[ETH_ALEN];
+  memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+  struct in6_addr tmp_ip;
+  memcpy(&tmp_ip, &ipv6->ip6_src, sizeof(tmp_ip));
+  memcpy(&ipv6->ip6_src, &ipv6->ip6_dst, sizeof(tmp_ip));
+  memcpy(&ipv6->ip6_src, &tmp_ip, sizeof(tmp_ip));
+
+  icmp->icmp6_type = ICMP6_ECHO_REQUEST;
+
+  icmp->icmp6_cksum = 0;
+  uint16_t checksum = calculate_internet_checksum(
+      (uint8_t *)&icmp, len - sizeof(struct ethhdr) - sizeof(struct ip6_hdr));
+  icmp->icmp6_cksum = checksum;
+
+  /* Here we sent the packet out of the receive port. Note that
+   * we allocate one entry and schedule it. Your design would be
+   * faster if you do batch processing/transmission */
+  unsigned int tx_idx = 0;
+  unsigned int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+  if (ret != 1) {
+    printf("ICMP6 cannot send reply\n");
+    return false;
+  }
+
+  printf("ICMP6 >>>>>>>>>>>>>>>>>>>>\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "ipv6_proto:0x%X\n"
+         "icmp_proto:0x%X\n",
+         ntohs(eth->h_proto),                 //
+         eth->h_dest[0],                      //
+         eth->h_dest[1],                      //
+         eth->h_dest[2],                      //
+         eth->h_dest[3],                      //
+         eth->h_dest[4],                      //
+         eth->h_dest[5],                      //
+         eth->h_source[0],                    //
+         eth->h_source[1],                    //
+         eth->h_source[2],                    //
+         eth->h_source[3],                    //
+         eth->h_source[4],                    //
+         eth->h_source[5],                    //
+         ipv6->ip6_ctlun.ip6_un1.ip6_un1_nxt, //
+         icmp->icmp6_type                     //
+  );
+
+  struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+  tx_desc->addr = addr;
+  tx_desc->len = len;
+  tx_desc->options = 0;
+  xsk_ring_prod__submit(&xsk->tx, 1);
+  xsk->outstanding_tx++;
+
+  xsk->stats.tx_bytes += len;
+  xsk->stats.tx_packets++;
+  return true;
 }
 
-static inline void csum_replace2(__sum16 *sum, __be16 old, __be16 new) {
-  *sum = ~csum16_add(csum16_sub(~(*sum), old), new);
+static bool process_icmp_v4(struct xsk_socket_info *xsk, uint64_t addr,
+                            uint32_t len) {
+  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+  if (len <
+      (sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct icmphdr))) {
+    return false;
+  }
+
+  struct ethhdr *eth = (struct ethhdr *)pkt;
+  struct iphdr *ipv4 = (struct iphdr *)(eth + 1);
+  struct icmphdr *icmp = (struct icmphdr *)(ipv4 + 1);
+
+  int fail_1 = ntohs(eth->h_proto) != ETH_P_IP;
+  int fail_2 = ipv4->protocol != IPPROTO_ICMP;
+  int fail_3 = icmp->type != ICMP_ECHO;
+  int fail_4 = icmp->code != 0;
+
+  // printf("ICMP4 %d %d %d %d\n", fail_1, fail_2, fail_3, fail_4);
+
+  if (fail_1 || fail_2 || fail_3 || fail_4) {
+    return false;
+  }
+
+  printf("ICMP4 <<<<<<<<<<<<<<<<\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "ipv4_proto:0x%X\n"
+         "icmp_proto:0x%X\n"
+         "icmp_code:0x%X\n",
+         ntohs(eth->h_proto), //
+         eth->h_dest[0],      //
+         eth->h_dest[1],      //
+         eth->h_dest[2],      //
+         eth->h_dest[3],      //
+         eth->h_dest[4],      //
+         eth->h_dest[5],      //
+         eth->h_source[0],    //
+         eth->h_source[1],    //
+         eth->h_source[2],    //
+         eth->h_source[3],    //
+         eth->h_source[4],    //
+         eth->h_source[5],    //
+         ipv4->protocol,      //
+         icmp->type,          //
+         icmp->code           //
+  );
+
+  uint8_t tmp_mac[ETH_ALEN];
+  memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, tmp_mac, ETH_ALEN);
+
+  uint32_t tmp_ip;
+  memcpy(&tmp_ip, &ipv4->saddr, sizeof(tmp_ip));
+  memcpy(&ipv4->saddr, &ipv4->daddr, sizeof(tmp_ip));
+  memcpy(&ipv4->daddr, &tmp_ip, sizeof(tmp_ip));
+
+  icmp->type = ICMP_ECHOREPLY;
+  icmp->checksum = 0;
+  uint16_t checksum = calculate_internet_checksum(
+      (uint8_t *)&icmp, len - sizeof(struct ethhdr) - sizeof(struct iphdr));
+  icmp->checksum = checksum;
+
+  unsigned int tx_idx = 0;
+  unsigned int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+  if (ret != 1) {
+    printf("ICMP4 cannot send reply\n");
+    return false;
+  }
+
+  printf("ICMP4 >>>>>>>>>>>>>>>\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "ipv4_proto:0x%X\n"
+         "icmp_proto:0x%X\n"
+         "icmp_code:0x%X\n",
+         ntohs(eth->h_proto), //
+         eth->h_dest[0],      //
+         eth->h_dest[1],      //
+         eth->h_dest[2],      //
+         eth->h_dest[3],      //
+         eth->h_dest[4],      //
+         eth->h_dest[5],      //
+         eth->h_source[0],    //
+         eth->h_source[1],    //
+         eth->h_source[2],    //
+         eth->h_source[3],    //
+         eth->h_source[4],    //
+         eth->h_source[5],    //
+         ipv4->protocol,      //
+         icmp->type,          //
+         icmp->code           //
+  );
+
+  struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+  tx_desc->addr = addr;
+  tx_desc->len = len;
+  tx_desc->options = 0;
+  xsk_ring_prod__submit(&xsk->tx, 1);
+  xsk->outstanding_tx++;
+
+  xsk->stats.tx_bytes += len;
+  xsk->stats.tx_packets++;
+  return true;
+}
+
+static bool process_arp_v4(struct xsk_socket_info *xsk, uint64_t addr,
+                           uint32_t len) {
+  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+  if (len < (sizeof(struct ethhdr) + sizeof(struct ether_arp))) {
+    return false;
+  }
+
+  struct ethhdr *eth = (struct ethhdr *)pkt;
+  struct ether_arp *arp = (struct ether_arp *)(eth + 1);
+
+  if (ntohs(eth->h_proto) != ETH_P_ARP) {
+    return false;
+  }
+
+  static_assert(sizeof(unsigned short) == 2);
+  static_assert(sizeof(uint16_t) == 2);
+
+  printf("ARP <<<<<<<<<<<<\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "eth_ar_hrd:0x%X\n"
+         "eth_ar_pro:0x%X\n"
+         "eth_ar_hln:0x%X\n"
+         "eth_ar_pln:0x%X\n"
+         "eth_ar_op:0x%X\n"
+         "arp_sha:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_spa:0x%X:%X:%X:%X\n"
+         "arp_tha:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_tpa:0x%X:%X:%X:%X\n",
+         ntohs(eth->h_proto),       //
+         eth->h_dest[0],            //
+         eth->h_dest[1],            //
+         eth->h_dest[2],            //
+         eth->h_dest[3],            //
+         eth->h_dest[4],            //
+         eth->h_dest[5],            //
+         eth->h_source[0],          //
+         eth->h_source[1],          //
+         eth->h_source[2],          //
+         eth->h_source[3],          //
+         eth->h_source[4],          //
+         eth->h_source[5],          //
+         ntohs(arp->ea_hdr.ar_hrd), //
+         ntohs(arp->ea_hdr.ar_pro), //
+         arp->ea_hdr.ar_hln,        //
+         arp->ea_hdr.ar_pln,        //
+         ntohs(arp->ea_hdr.ar_op),  //
+         arp->arp_sha[0],           //
+         arp->arp_sha[1],           //
+         arp->arp_sha[2],           //
+         arp->arp_sha[3],           //
+         arp->arp_sha[4],           //
+         arp->arp_sha[5],           //
+         arp->arp_spa[0],           //
+         arp->arp_spa[1],           //
+         arp->arp_spa[2],           //
+         arp->arp_spa[3],           //
+         arp->arp_tha[0],           //
+         arp->arp_tha[1],           //
+         arp->arp_tha[2],           //
+         arp->arp_tha[3],           //
+         arp->arp_tha[4],           //
+         arp->arp_tha[5],           //
+         arp->arp_tpa[0],           //
+         arp->arp_tpa[1],           //
+         arp->arp_tpa[2],           //
+         arp->arp_tpa[3]            //
+  );
+
+  // GARP request
+  if (arp->ea_hdr.ar_op == ARPOP_REQUEST && //
+      arp->arp_tpa[3] == arp->arp_spa[3] && //
+      arp->arp_tpa[2] == arp->arp_spa[2] && //
+      arp->arp_tpa[1] == arp->arp_spa[1] && //
+      arp->arp_tpa[0] == arp->arp_spa[0] && //
+      arp->arp_tha[5] == 0 &&               //
+      arp->arp_tha[4] == 0 &&               //
+      arp->arp_tha[3] == 0 &&               //
+      arp->arp_tha[2] == 0 &&               //
+      arp->arp_tha[1] == 0 &&               //
+      arp->arp_tha[0] == 0                  //
+  ) {
+    printf("ARP GARP request\n");
+    return true;
+  }
+
+  // GARP reply
+  if (arp->ea_hdr.ar_op == ARPOP_REPLY &&   //
+      arp->arp_tpa[3] == arp->arp_spa[3] && //
+      arp->arp_tpa[2] == arp->arp_spa[2] && //
+      arp->arp_tpa[1] == arp->arp_spa[1] && //
+      arp->arp_tpa[0] == arp->arp_spa[0] && //
+      arp->arp_tha[5] == arp->arp_sha[5] && //
+      arp->arp_tha[4] == arp->arp_sha[4] && //
+      arp->arp_tha[3] == arp->arp_sha[3] && //
+      arp->arp_tha[2] == arp->arp_sha[2] && //
+      arp->arp_tha[1] == arp->arp_sha[1] && //
+      arp->arp_tha[0] == arp->arp_sha[0]    //
+  ) {
+    printf("ARP GARP reply\n");
+    return true;
+  }
+
+  unsigned int tx_idx = 0;
+  unsigned int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+  if (ret != 1) {
+    printf("ARP cannot send reply\n");
+    return false;
+  }
+
+  arp->ea_hdr.ar_op = htons(ARPOP_REPLY);
+  // uint8_t tmp_tha[ETH_ALEN];
+  char *our_MAC_address = "\xca\x88\x4f\xae\xd1\x61";
+  uint8_t tmp_tpa[4];
+  // memcpy(&tmp_tha, &arp->arp_tha, ETH_ALEN);
+
+  memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
+  memcpy(eth->h_source, our_MAC_address, ETH_ALEN);
+  memcpy(&tmp_tpa, &arp->arp_tpa, 4);
+  memcpy(&arp->arp_tha, &arp->arp_sha, ETH_ALEN);
+  memcpy(&arp->arp_tpa, &arp->arp_spa, 4);
+  memcpy(&arp->arp_sha, our_MAC_address, ETH_ALEN);
+  memcpy(&arp->arp_spa, &tmp_tpa, 4);
+
+  printf("ARP >>>>>>>>>>>>>>>\n"
+         "eth_proto:0x%X\n"
+         "eth_dest:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_src:0x%X:%X:%X:%X:%X:%X\n"
+         "eth_ar_hrd:0x%X\n"
+         "eth_ar_pro:0x%X\n"
+         "eth_ar_hln:0x%X\n"
+         "eth_ar_pln:0x%X\n"
+         "eth_ar_op:0x%X\n"
+         "arp_sha:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_spa:0x%X:%X:%X:%X\n"
+         "arp_tha:0x%X:%X:%X:%X:%X:%X\n"
+         "arp_tpa:0x%X:%X:%X:%X\n",
+         ntohs(eth->h_proto),       //
+         eth->h_dest[0],            //
+         eth->h_dest[1],            //
+         eth->h_dest[2],            //
+         eth->h_dest[3],            //
+         eth->h_dest[4],            //
+         eth->h_dest[5],            //
+         eth->h_source[0],          //
+         eth->h_source[1],          //
+         eth->h_source[2],          //
+         eth->h_source[3],          //
+         eth->h_source[4],          //
+         eth->h_source[5],          //
+         ntohs(arp->ea_hdr.ar_hrd), //
+         ntohs(arp->ea_hdr.ar_pro), //
+         arp->ea_hdr.ar_hln,        //
+         arp->ea_hdr.ar_pln,        //
+         ntohs(arp->ea_hdr.ar_op),  //
+         arp->arp_sha[0],           //
+         arp->arp_sha[1],           //
+         arp->arp_sha[2],           //
+         arp->arp_sha[3],           //
+         arp->arp_sha[4],           //
+         arp->arp_sha[5],           //
+         arp->arp_spa[0],           //
+         arp->arp_spa[1],           //
+         arp->arp_spa[2],           //
+         arp->arp_spa[3],           //
+         arp->arp_tha[0],           //
+         arp->arp_tha[1],           //
+         arp->arp_tha[2],           //
+         arp->arp_tha[3],           //
+         arp->arp_tha[4],           //
+         arp->arp_tha[5],           //
+         arp->arp_tpa[0],           //
+         arp->arp_tpa[1],           //
+         arp->arp_tpa[2],           //
+         arp->arp_tpa[3]            //
+  );
+
+  struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+  tx_desc->addr = addr;
+  tx_desc->len = len;
+  tx_desc->options = 0;
+  xsk_ring_prod__submit(&xsk->tx, 1);
+  xsk->outstanding_tx++;
+
+  xsk->stats.tx_bytes += len;
+  xsk->stats.tx_packets++;
+
+  return true;
+}
+
+static bool process_arp_tcp(struct xsk_socket_info *xsk, uint64_t addr,
+                            uint32_t len) {
+  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+
+  if (len < (sizeof(struct ethhdr) + sizeof(struct ether_arp))) {
+    return false;
+  }
+
+  printf("receive TCP\n");
+
+  return true;
 }
 
 static bool process_packet(struct xsk_socket_info *xsk, uint64_t addr,
                            uint32_t len) {
-  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
-
-  /* Lesson#3: Write an IPv6 ICMP ECHO parser to send responses
-   *
-   * Some assumptions to make it easier:
-   * - No VLAN handling
-   * - Only if nexthdr is ICMP
-   * - Just return all data with MAC/IP swapped, and type set to
-   *   ICMPV6_ECHO_REPLY
-   * - Recalculate the icmp checksum */
-
-  if (false) {
-    int ret;
-    uint32_t tx_idx = 0;
-    uint8_t tmp_mac[ETH_ALEN];
-    struct in6_addr tmp_ip;
-    struct ethhdr *eth = (struct ethhdr *)pkt;
-    struct ipv6hdr *ipv6 = (struct ipv6hdr *)(eth + 1);
-    struct icmp6hdr *icmp = (struct icmp6hdr *)(ipv6 + 1);
-
-    if (ntohs(eth->h_proto) != ETH_P_IPV6 ||
-        len < (sizeof(*eth) + sizeof(*ipv6) + sizeof(*icmp)) ||
-        ipv6->nexthdr != IPPROTO_ICMPV6 ||
-        icmp->icmp6_type != ICMPV6_ECHO_REQUEST)
-      return false;
-
-    memcpy(tmp_mac, eth->h_dest, ETH_ALEN);
-    memcpy(eth->h_dest, eth->h_source, ETH_ALEN);
-    memcpy(eth->h_source, tmp_mac, ETH_ALEN);
-
-    memcpy(&tmp_ip, &ipv6->saddr, sizeof(tmp_ip));
-    memcpy(&ipv6->saddr, &ipv6->daddr, sizeof(tmp_ip));
-    memcpy(&ipv6->daddr, &tmp_ip, sizeof(tmp_ip));
-
-    icmp->icmp6_type = ICMPV6_ECHO_REPLY;
-
-    csum_replace2(&icmp->icmp6_cksum, htons(ICMPV6_ECHO_REQUEST << 8),
-                  htons(ICMPV6_ECHO_REPLY << 8));
-
-    /* Here we sent the packet out of the receive port. Note that
-     * we allocate one entry and schedule it. Your design would be
-     * faster if you do batch processing/transmission */
-
-    ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
-    if (ret != 1) {
-      /* No more transmit slots, drop the packet */
-      return false;
-    }
-
-    xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->addr = addr;
-    xsk_ring_prod__tx_desc(&xsk->tx, tx_idx)->len = len;
-    xsk_ring_prod__submit(&xsk->tx, 1);
-    xsk->outstanding_tx++;
-
-    xsk->stats.tx_bytes += len;
-    xsk->stats.tx_packets++;
+  printf("process packet\n");
+  bool is_ok = false;
+  is_ok = process_icmp_v6(xsk, addr, len);
+  if (is_ok) {
     return true;
   }
+
+  is_ok = process_icmp_v4(xsk, addr, len);
+  if (is_ok) {
+    return true;
+  }
+
+  is_ok = process_arp_v4(xsk, addr, len);
+  if (is_ok) {
+    return true;
+  }
+
+  uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
+  struct ethhdr *eth = (struct ethhdr *)pkt;
+  printf("UNKNOWN eth_proto:0x%X\n", ntohs(eth->h_proto));
 
   return false;
 }
@@ -369,19 +769,19 @@ static void handle_receive_packets(struct xsk_socket_info *xsk) {
 
 static void rx_and_process(struct config *cfg,
                            struct xsk_socket_info *xsk_socket) {
-  // struct pollfd fds[2];
-  // int ret, nfds = 1;
+  struct pollfd fds[2];
+  int ret, nfds = 1;
 
-  // memset(fds, 0, sizeof(fds));
-  // fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
-  // fds[0].events = POLLIN;
+  memset(fds, 0, sizeof(fds));
+  fds[0].fd = xsk_socket__fd(xsk_socket->xsk);
+  fds[0].events = POLLIN;
 
   while (!global_exit) {
-    // if (cfg->xsk_poll_mode) {
-    // 	ret = poll(fds, nfds, -1);
-    // 	if (ret <= 0 || ret > 1)
-    // 		continue;
-    // }
+    if (cfg->xsk_poll_mode) {
+      ret = poll(fds, nfds, -1);
+      if (ret <= 0 || ret > 1)
+        continue;
+    }
     handle_receive_packets(xsk_socket);
   }
 }
@@ -580,17 +980,17 @@ int main(int argc, char **argv) {
     exit(EXIT_FAILURE);
   }
 
-  /* Start thread to do statistics display */
-  if (verbose) {
-    ret = pthread_create(&stats_poll_thread, NULL, stats_poll, xsk_socket);
-    if (ret) {
-      fprintf(stderr,
-              "ERROR: Failed creating statistics thread "
-              "\"%s\"\n",
-              strerror(errno));
-      exit(EXIT_FAILURE);
-    }
-  }
+  // /* Start thread to do statistics display */
+  // if (verbose) {
+  //   ret = pthread_create(&stats_poll_thread, NULL, stats_poll, xsk_socket);
+  //   if (ret) {
+  //     fprintf(stderr,
+  //             "ERROR: Failed creating statistics thread "
+  //             "\"%s\"\n",
+  //             strerror(errno));
+  //     exit(EXIT_FAILURE);
+  //   }
+  // }
 
   /* Receive and count packets than drop them */
   rx_and_process(&cfg, xsk_socket);

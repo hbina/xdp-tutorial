@@ -337,7 +337,9 @@ reset()
 ns_exec()
 {
     get_nsname && ensure_nsname "$NS"
-
+    echo "NS $NS"
+    echo "SETUP_SCRIPT $SETUP_SCRIPT"
+    echo "@ $@"
     ip netns exec "$NS" env TESTENV_NAME="$NS" "$SETUP_SCRIPT" "$@"
 }
 
@@ -371,7 +373,8 @@ run_ping()
         fi
     fi
 
-    ns_exec "$PING" "$IP" "$@"
+    echo "$PING" "$IP" "$@" -i 1
+    ns_exec "$PING" "$IP" "$@" -i 1
 }
 
 run_tcpdump()
