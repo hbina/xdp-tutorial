@@ -386,11 +386,11 @@ static inline uint16_t calculate_internet_checksum(uint8_t *addr,
     sum = sum + *(addr + (iter * 2));
   }
 
-  while (sum >> 16) {
-    sum = (sum & 0xFFFF) + (sum >> 16);
-  }
+  sum = (sum >> 16) + (sum & 0xFFFF);
+  sum += (sum >> 16);
+  uint16_t answer = ~sum & 0xFFFF;
 
-  return (~sum);
+  return answer;
 }
 
 static bool process_icmp_v6(struct xsk_socket_info *xsk, uint64_t addr,
@@ -445,7 +445,7 @@ static bool process_icmp_v6(struct xsk_socket_info *xsk, uint64_t addr,
     return false;
   }
 
-  printf("ICMP6 >>>>>>>>\n");
+  printf("ICMP6 (%d) >>>>>>>>\n", tx_idx);
   print_ethernet_header(eth_hdr);
   print_ipv6_header(ipv6_hdr);
   print_icmpv6_header(icmp6_hdr);
@@ -470,15 +470,13 @@ static bool process_icmp_v4(struct xsk_socket_info *xsk, uint64_t addr,
   }
 
   struct ethhdr *eth_hdr = (struct ethhdr *)pkt;
-  struct iphdr *ipv4_hdr = (struct iphdr *)(eth_hdr + 1);
-  struct icmphdr *icmp_hdr = (struct icmphdr *)(ipv4_hdr + 1);
+  struct iphdr *ip_hdr = (struct iphdr *)(eth_hdr + 1);
+  struct icmphdr *icmp_hdr = (struct icmphdr *)(ip_hdr + 1);
 
   int fail_1 = ntohs(eth_hdr->h_proto) != ETH_P_IP;
-  int fail_2 = ipv4_hdr->protocol != IPPROTO_ICMP;
+  int fail_2 = ip_hdr->protocol != IPPROTO_ICMP;
   int fail_3 = icmp_hdr->type != ICMP_ECHO;
   int fail_4 = icmp_hdr->code != 0;
-
-  // printf("ICMP4 %d %d %d %d\n", fail_1, fail_2, fail_3, fail_4);
 
   if (fail_1 || fail_2 || fail_3 || fail_4) {
     return false;
@@ -486,8 +484,29 @@ static bool process_icmp_v4(struct xsk_socket_info *xsk, uint64_t addr,
 
   printf("ICMP4 <<<<<<<<\n");
   print_ethernet_header(eth_hdr);
-  print_ipv4_header(ipv4_hdr);
+  print_ipv4_header(ip_hdr);
   print_icmp_header(icmp_hdr);
+
+  uint16_t expected_checksum = icmp_hdr->checksum;
+  uint32_t calculated_len = len - sizeof(struct ethhdr) - sizeof(struct iphdr);
+  uint32_t calculated_len2 = ntohs(ip_hdr->tot_len) - sizeof(struct iphdr);
+
+  // Validate checksum
+  {
+    if (calculated_len != calculated_len2) {
+      printf("ip_hdr->tot_len %hu calculated_len %d calculated_len2 %d\n",
+             ntohs(ip_hdr->tot_len), calculated_len, calculated_len2);
+      assert(false);
+    }
+    icmp_hdr->checksum = 0;
+    uint16_t calculcated_checksum =
+        calculate_internet_checksum((uint8_t *)icmp_hdr, calculated_len);
+    if (expected_checksum != calculcated_checksum) {
+      printf("expected_checksum 0x%x calculcated_checksum 0x%x\n",
+             expected_checksum, calculcated_checksum);
+      assert(false);
+    }
+  }
 
   uint8_t tmp_mac[ETH_ALEN];
   memcpy(tmp_mac, eth_hdr->h_dest, ETH_ALEN);
@@ -495,14 +514,14 @@ static bool process_icmp_v4(struct xsk_socket_info *xsk, uint64_t addr,
   memcpy(eth_hdr->h_source, tmp_mac, ETH_ALEN);
 
   uint32_t tmp_ip;
-  memcpy(&tmp_ip, &ipv4_hdr->saddr, sizeof(tmp_ip));
-  memcpy(&ipv4_hdr->saddr, &ipv4_hdr->daddr, sizeof(tmp_ip));
-  memcpy(&ipv4_hdr->daddr, &tmp_ip, sizeof(tmp_ip));
+  memcpy(&tmp_ip, &ip_hdr->saddr, sizeof(tmp_ip));
+  memcpy(&ip_hdr->saddr, &ip_hdr->daddr, sizeof(tmp_ip));
+  memcpy(&ip_hdr->daddr, &tmp_ip, sizeof(tmp_ip));
 
   icmp_hdr->type = ICMP_ECHOREPLY;
   icmp_hdr->checksum = 0;
-  uint16_t checksum = calculate_internet_checksum(
-      (uint8_t *)&icmp_hdr, len - sizeof(struct ethhdr) - sizeof(struct iphdr));
+  uint16_t checksum =
+      calculate_internet_checksum((uint8_t *)icmp_hdr, calculated_len);
   icmp_hdr->checksum = checksum;
 
   unsigned int tx_idx = 0;
@@ -512,9 +531,9 @@ static bool process_icmp_v4(struct xsk_socket_info *xsk, uint64_t addr,
     return false;
   }
 
-  printf("ICMP4 >>>>>>>>\n");
+  printf("ICMP4 (%d) >>>>>>>>\n", tx_idx);
   print_ethernet_header(eth_hdr);
-  print_ipv4_header(ipv4_hdr);
+  print_ipv4_header(ip_hdr);
   print_icmp_header(icmp_hdr);
 
   struct xdp_desc *tx_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
@@ -631,15 +650,15 @@ static bool process_arp_tcp(struct xsk_socket_info *xsk, uint64_t addr,
   return true;
 }
 
-const char *DST_MAC = "\x08\x5B\xD6\x0C\x79\xED";
-const char *SRC_MC = "\xCE\xA2\x3E\xAF\x43\x5E";
+const char *DST_MAC = "\x56\x0C\xF9\xFF\x19\xE8";
+const char *SRC_MC = "\xCA\x88\x4F\xAE\xD1\x61";
 // 08:5b:d6:0c:79:ed
 // ce:a2:3e:af:43:5e
 
 uint8_t sent = 0;
 
 static bool init_tcp(struct xsk_socket_info *xsk) {
-  printf("init_tcp\n");
+  // printf("init_tcp\n");
   if (sent == 1) {
     return false;
   }
@@ -669,8 +688,23 @@ static bool init_tcp(struct xsk_socket_info *xsk) {
   printf("xdp_desc.len:%u\n", xdp_desc->len);
 
   struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
-  struct iphdr *ip_hdr = (struct iphdr *)buffer + 1;
-  struct tcphdr *tcp_hdr = (struct tcphdr *)ip_hdr + 1;
+  struct iphdr *ip_hdr = (struct iphdr *)(eth_hdr + 1);
+  struct tcphdr *tcp_hdr = (struct tcphdr *)(ip_hdr + 1);
+
+  // struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
+  // struct iphdr *ip_hdr = (struct iphdr *)(buffer + sizeof(struct ethhdr));
+  // struct tcphdr *tcp_hdr =
+  //     (struct tcphdr *)(buffer + sizeof(struct ethhdr) + sizeof(struct
+  //     iphdr));
+
+  uint64_t diff1 = (uint64_t)(void *)ip_hdr - (uint64_t)(void *)(eth_hdr);
+  uint64_t diff2 = (uint64_t)(void *)tcp_hdr - (uint64_t)(void *)(ip_hdr);
+
+  printf("ethhdr:%lu\n", sizeof(struct ethhdr));
+  printf("iphdr:%lu\n", sizeof(struct iphdr));
+  printf("tcphdr:%lu\n", sizeof(struct tcphdr));
+  printf("diff1:%lu\n", diff1);
+  printf("diff2:%lu\n", diff2);
 
   assert(sizeof(eth_hdr->h_dest) == strlen(DST_MAC));
   assert(sizeof(eth_hdr->h_source) == strlen(SRC_MC));
@@ -683,8 +717,8 @@ static bool init_tcp(struct xsk_socket_info *xsk) {
   // IPV4
   uint32_t src_addr = 0;
   uint32_t dst_addr = 0;
-  assert(inet_pton(AF_INET, "192.168.1.15", &src_addr) == 1);
-  assert(inet_pton(AF_INET, "192.168.1.11", &dst_addr) == 1);
+  assert(inet_pton(AF_INET, "10.11.1.2", &src_addr) == 1);
+  assert(inet_pton(AF_INET, "10.11.1.1", &dst_addr) == 1);
   static_assert(sizeof(struct iphdr) + sizeof(struct tcphdr) == 40, "mismatch");
 
   ip_hdr->ihl = 5;
@@ -697,13 +731,22 @@ static bool init_tcp(struct xsk_socket_info *xsk) {
   ip_hdr->saddr = src_addr;
   ip_hdr->daddr = dst_addr;
 
+  ip_hdr->check = 0;
+  uint16_t calculated_checksum =
+      calculate_internet_checksum((uint8_t *)ip_hdr, sizeof(struct iphdr));
+  ip_hdr->check = calculated_checksum;
+
   // TCP
-  tcp_hdr->source = htons(9090);
-  tcp_hdr->dest = htons(8080);
+  tcp_hdr->th_sport = htons(9090);
+  tcp_hdr->th_dport = htons(8080);
+  tcp_hdr->th_off = 5;
+  tcp_hdr->th_flags = TH_SYN;
+  tcp_hdr->th_win = ntohs(0xFAF0);
+  tcp_hdr->th_seq = ntohl(0x10101010);
 
   // the rest of it...
 
-  printf("TCP >>>>>>>>\n");
+  printf("TCP (%d) >>>>>>>>\n", tx_idx);
   print_ethernet_header(eth_hdr);
   print_ipv4_header(ip_hdr);
   print_tcp_header(tcp_hdr);
@@ -711,6 +754,7 @@ static bool init_tcp(struct xsk_socket_info *xsk) {
   xsk_ring_prod__submit(&xsk->tx, 1);
   xsk->outstanding_tx++;
 
+  complete_tx(xsk);
   return true;
 }
 
@@ -741,14 +785,16 @@ static bool handle_recv(struct xsk_socket_info *xsk, uint64_t addr,
 }
 
 static void inner_main_loop(struct xsk_socket_info *xsk) {
-  printf("inner_main_loop\n");
+  // printf("inner_main_loop\n");
   unsigned int rcvd, stock_frames, i;
   uint32_t idx_rx = 0, idx_fq = 0;
   int ret;
 
+  init_tcp(xsk);
+
   rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
   if (!rcvd) {
-    printf("no free RX\n");
+    // printf("no free RX\n");
     return;
   }
 
@@ -761,7 +807,7 @@ static void inner_main_loop(struct xsk_socket_info *xsk) {
 
     /* This should not happen, but just in case */
     while (ret != stock_frames) {
-      printf("reserving TX %d %d\n", ret, stock_frames);
+      // printf("reserving TX %d %d\n", ret, stock_frames);
       ret = xsk_ring_prod__reserve(&xsk->umem->fq, rcvd, &idx_fq);
     }
 
@@ -783,8 +829,6 @@ static void inner_main_loop(struct xsk_socket_info *xsk) {
   }
 
   xsk_ring_cons__release(&xsk->rx, rcvd);
-
-  // init_tcp(xsk);
 
   /* Do we need to wake up the kernel for transmission */
   complete_tx(xsk);
