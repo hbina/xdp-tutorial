@@ -704,10 +704,22 @@ static bool tcp_init(struct xsk_socket_info *xsk) {
   // printf("xdp_desc.addr:%llu\n", xdp_desc->addr);
   // printf("xdp_desc.len:%u\n", xdp_desc->len);
 
-  struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
-  struct iphdr *ipv4_hdr = (struct iphdr *)(eth_hdr + 1);
-  struct tcphdr *tcp_hdr = (struct tcphdr *)(ipv4_hdr + 1);
-  char *tcp_options = (char *)(tcp_hdr + 1);
+  // struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
+  // struct iphdr *ipv4_hdr = (struct iphdr *)(eth_hdr + 1);
+  // struct tcphdr *tcp_hdr = (struct tcphdr *)(ipv4_hdr + 1);
+  // char *tcp_options = (char *)(tcp_hdr + 1);
+  struct ethhdr eth_hdr_v;
+  struct iphdr ipv4_hdr_v;
+  struct tcphdr tcp_hdr_v;
+  char tcp_options_v[4];
+  struct ethhdr *eth_hdr = &eth_hdr_v;
+  struct iphdr *ipv4_hdr = &ipv4_hdr_v;
+  struct tcphdr *tcp_hdr = &tcp_hdr_v;
+  char *tcp_options = tcp_options_v;
+  memset(eth_hdr, 0, sizeof(struct ethhdr));
+  memset(ipv4_hdr, 0, sizeof(struct iphdr));
+  memset(tcp_hdr, 0, sizeof(struct tcphdr));
+  memset(tcp_options_v, 0, 4);
 
   // uint64_t diff1 = (uint64_t)(void *)ipv4_hdr - (uint64_t)(void *)(eth_hdr);
   // uint64_t diff2 = (uint64_t)(void *)tcp_hdr - (uint64_t)(void *)(ipv4_hdr);
@@ -779,14 +791,17 @@ static bool tcp_init(struct xsk_socket_info *xsk) {
     hdr1->proto = ipv4_hdr->protocol;
     hdr1->len = htons(24);
     struct tcphdr *hdr2 = (struct tcphdr *)(hdr1 + 1);
-    memcpy((char *)hdr2, (char *)(tcp_hdr), sizeof(struct tcphdr) + 4);
+    memcpy(ss + sizeof(struct pseudo_tcphdr), (char *)tcp_hdr,
+           sizeof(struct tcphdr));
+    memcpy(ss + sizeof(struct pseudo_tcphdr) + sizeof(struct tcphdr),
+           (char *)tcp_options, 4);
 
-    printf("saddr->%x\n", ntohl(hdr1->saddr));
-    printf("daddr->%x\n", ntohl(hdr1->daddr));
-    printf("proto->%d\n", hdr1->proto);
-    printf("len->%d\n", ntohs(hdr1->len));
+    // printf("saddr->%x\n", ntohl(hdr1->saddr));
+    // printf("daddr->%x\n", ntohl(hdr1->daddr));
+    // printf("proto->%d\n", hdr1->proto);
+    // printf("len->%d\n", ntohs(hdr1->len));
 
-    print_tcp_header(hdr2);
+    // print_tcp_header(hdr2);
     // printf("saddr->%x\n", n_saddr);
     // printf("saddr->%x\n", ntohl(hdr1->saddr));
     // printf("daddr->%x\n", ntohl(hdr1->daddr));
@@ -807,6 +822,15 @@ static bool tcp_init(struct xsk_socket_info *xsk) {
   print_ethernet_header(eth_hdr);
   print_ipv4_header(ipv4_hdr);
   print_tcp_header(tcp_hdr);
+
+  // memcpy to the buffer
+  memcpy(buffer, eth_hdr, sizeof(struct ethhdr));
+  memcpy(buffer + sizeof(struct ethhdr), ipv4_hdr, sizeof(struct iphdr));
+  memcpy(buffer + sizeof(struct ethhdr) + sizeof(struct iphdr), tcp_hdr,
+         sizeof(struct tcphdr));
+  memcpy(buffer + sizeof(struct ethhdr) + sizeof(struct iphdr) +
+             sizeof(struct tcphdr),
+         tcp_options, 4);
 
   xsk_ring_prod__submit(&xsk->tx, 1);
   xsk->outstanding_tx++;
