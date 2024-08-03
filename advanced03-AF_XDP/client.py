@@ -4,8 +4,8 @@ import websockets
 from websockets.sync.client import connect
 
 
-uri = "ws://10.11.1.1:8080"
-interface = "10.11.1.2"
+uri = "ws://10.11.1.2:8080"
+interface = "10.11.1.1"
 
 
 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

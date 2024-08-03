@@ -18,7 +18,7 @@ async def main():
     # sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     # sock.bind(("10.11.1.1", 8080))
     async with websockets.serve(
-        send_random_messages, "10.11.1.1", 8080, compression=None
+        send_random_messages, "10.11.1.2", 8080, compression=None
     ):
         print("listening...")
         await asyncio.Future()  # Run forever

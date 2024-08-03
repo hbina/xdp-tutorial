@@ -76,6 +76,14 @@ struct xsk_socket_info {
   uint32_t outstanding_tx;
 };
 
+// const char *SRC_MC = "\xCA\x88\x4F\xAE\xD1\x61";Q
+const char *DST_MAC = "\xCA\x88\x4F\xAE\xD1\x61";
+// const char *SRC_MC = "\x56\x0C\xF9\xFF\x19\xE8";
+// const char *DST_MAC = "\x56\x0C\xF9\xFF\x19\xE8";
+const char *SRC_MC = "\xFA\x0E\x55\x24\x54\xC2";
+// const char *DST_MAC = "\xFA\x0E\x55\x24\x54\xC2";
+// fa:0e:55:24:54:c2
+
 static void print_ethernet_header(const struct ethhdr *eth) {
   printf("Ethernet Header\n");
   printf("\t|-Destination Address : ");
@@ -650,26 +658,172 @@ static bool process_arp_tcp(struct xsk_socket_info *xsk, uint64_t addr,
   return true;
 }
 
-const char *DST_MAC = "\x56\x0C\xF9\xFF\x19\xE8";
-const char *SRC_MC = "\xCA\x88\x4F\xAE\xD1\x61";
-// 08:5b:d6:0c:79:ed
-// ce:a2:3e:af:43:5e
-
 uint8_t sent = 0;
 
-static bool init_tcp(struct xsk_socket_info *xsk) {
-  // printf("init_tcp\n");
+static bool tcp_init(struct xsk_socket_info *xsk) {
+
   if (sent == 1) {
     return false;
   }
   sent = 1;
 
-  printf("init_tcp\n");
+  printf("tcp_init\n");
 
   unsigned int tx_idx = 0;
   unsigned int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
   if (ret != 1) {
-    printf("init_tcp: Unable to reserve XSK producer\n");
+    printf("tcp_init: Unable to reserve XSK producer\n");
+    return false;
+  }
+
+  const size_t payload_len =
+      sizeof(struct ethhdr) + sizeof(struct iphdr) + sizeof(struct tcphdr) + 4;
+
+  // printf("payload_len:%zu\n", payload_len);
+  // printf("tx_idx:%u\n", tx_idx);
+
+  struct xdp_desc *xdp_desc = xsk_ring_prod__tx_desc(&xsk->tx, tx_idx);
+  char *buffer = xsk_umem__get_data(xsk->umem->buffer, xdp_desc->addr);
+  xdp_desc->len = payload_len;
+  memset(buffer, 0, payload_len);
+
+  // printf("xdp_desc.addr:%llu\n", xdp_desc->addr);
+  // printf("xdp_desc.len:%u\n", xdp_desc->len);
+
+  struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
+  struct iphdr *ip_hdr = (struct iphdr *)(eth_hdr + 1);
+  struct tcphdr *tcp_hdr = (struct tcphdr *)(ip_hdr + 1);
+  char *tcp_options = (char *)(tcp_hdr + 1);
+
+  // struct ethhdr *eth_hdr = (struct ethhdr *)buffer;
+  // struct iphdr *ip_hdr = (struct iphdr *)(buffer + sizeof(struct ethhdr));
+  // struct tcphdr *tcp_hdr =
+  //     (struct tcphdr *)(buffer + sizeof(struct ethhdr) + sizeof(struct
+  //     iphdr));
+
+  uint64_t diff1 = (uint64_t)(void *)ip_hdr - (uint64_t)(void *)(eth_hdr);
+  uint64_t diff2 = (uint64_t)(void *)tcp_hdr - (uint64_t)(void *)(ip_hdr);
+
+  // printf("ethhdr:%lu\n", sizeof(struct ethhdr));
+  // printf("iphdr:%lu\n", sizeof(struct iphdr));
+  // printf("tcphdr:%lu\n", sizeof(struct tcphdr));
+  // printf("diff1:%lu\n", diff1);
+  // printf("diff2:%lu\n", diff2);
+
+  assert(sizeof(eth_hdr->h_dest) == strlen(DST_MAC));
+  assert(sizeof(eth_hdr->h_source) == strlen(SRC_MC));
+
+  // ETHERNET TYPE II
+  memcpy(&eth_hdr->h_dest, DST_MAC, strlen(DST_MAC));
+  memcpy(&eth_hdr->h_source, SRC_MC, strlen(SRC_MC));
+  eth_hdr->h_proto = htons(ETH_P_IP);
+
+  // IPV4
+  uint32_t n_saddr = 0;
+  uint32_t n_daddr = 0;
+  assert(inet_pton(AF_INET, "10.11.1.2", &n_saddr) == 1);
+  assert(inet_pton(AF_INET, "10.11.1.1", &n_daddr) == 1);
+  static_assert(sizeof(struct iphdr) + sizeof(struct tcphdr) == 40, "mismatch");
+
+  time_t seconds = time(NULL);
+
+  ip_hdr->ihl = 5;
+  ip_hdr->version = 4;
+  ip_hdr->tot_len = htons(44);
+  ip_hdr->id = htons(seconds % 4096);
+  ip_hdr->frag_off = htons(0x4000);
+  ip_hdr->ttl = 64;
+  ip_hdr->protocol = 6;
+  ip_hdr->saddr = n_saddr;
+  ip_hdr->daddr = n_daddr;
+
+  ip_hdr->check = 0;
+  {
+    uint16_t calculated_checksum =
+        calculate_internet_checksum((uint8_t *)ip_hdr, sizeof(struct iphdr));
+    ip_hdr->check = calculated_checksum;
+  }
+
+  // TCP
+  tcp_hdr->th_sport = htons((seconds % 4096) + 4096);
+  tcp_hdr->th_dport = htons(8080);
+  tcp_hdr->th_seq = seconds % 4096;
+  tcp_hdr->th_off = 6;
+  tcp_hdr->th_flags = TH_SYN;
+  tcp_hdr->th_win = ntohs(512);
+  tcp_hdr->th_seq = ntohl(seconds % (1024 * 1024));
+
+  // TCP Options
+  *(tcp_options + 0) = 2;
+  *(tcp_options + 1) = 4;
+  *(uint16_t *)(tcp_options + 2) = ntohs(0x05B4);
+
+  {
+    struct tcp_pseudo_hdr {
+      uint32_t saddr;
+      uint32_t daddr;
+      uint8_t zero;
+      uint8_t proto;
+      uint16_t len;
+    };
+    char *ss =
+        malloc(sizeof(struct tcp_pseudo_hdr) + sizeof(struct tcphdr) + 4);
+    struct tcp_pseudo_hdr *hdr1 = (struct tcp_pseudo_hdr *)(ss);
+    hdr1->saddr = n_saddr;
+    hdr1->daddr = n_daddr;
+    hdr1->proto = ip_hdr->protocol;
+    hdr1->len = htons(24);
+    struct tcphdr *hdr2 = (struct tcphdr *)(hdr1 + 1);
+    memcpy((char *)hdr2, (char *)(tcp_hdr), sizeof(struct tcphdr) + 4);
+
+    // printf("saddr->%x\n", ntohl(hdr1->saddr));
+    // printf("daddr->%x\n", ntohl(hdr1->daddr));
+    // printf("proto->%d\n", hdr1->proto);
+    // printf("len->%d\n", ntohs(hdr1->len));
+
+    print_tcp_header(hdr2);
+    // printf("saddr->%x\n", n_saddr);
+    // printf("saddr->%x\n", ntohl(hdr1->saddr));
+    // printf("daddr->%x\n", ntohl(hdr1->daddr));
+    // printf("proto->%d\n", hdr1->proto);
+    // printf("len->%d\n", ntohs(hdr1->len));
+    // printf("daddr->%d", hdr1->saddr);
+
+    tcp_hdr->check = 0;
+    uint16_t calculated_checksum = calculate_internet_checksum(
+        (uint8_t *)ss,
+        sizeof(struct tcp_pseudo_hdr) + sizeof(struct tcphdr) + 4);
+    tcp_hdr->check = calculated_checksum;
+    free(ss);
+  }
+
+  // the rest of it...
+
+  printf("TCP (%d) >>>>>>>>\n", tx_idx);
+  print_ethernet_header(eth_hdr);
+  print_ipv4_header(ip_hdr);
+  print_tcp_header(tcp_hdr);
+
+  xsk_ring_prod__submit(&xsk->tx, 1);
+  xsk->outstanding_tx++;
+
+  complete_tx(xsk);
+  return true;
+}
+
+static bool tcp_send_data(struct xsk_socket_info *xsk) {
+  // printf("tcp_init\n");
+  if (sent == 1) {
+    return false;
+  }
+  sent = 1;
+
+  printf("tcp_init\n");
+
+  unsigned int tx_idx = 0;
+  unsigned int ret = xsk_ring_prod__reserve(&xsk->tx, 1, &tx_idx);
+  if (ret != 1) {
+    printf("tcp_init: Unable to reserve XSK producer\n");
     return false;
   }
 
@@ -739,9 +893,10 @@ static bool init_tcp(struct xsk_socket_info *xsk) {
   // TCP
   tcp_hdr->th_sport = htons(9090);
   tcp_hdr->th_dport = htons(8080);
+  tcp_hdr->th_seq = 1;
   tcp_hdr->th_off = 5;
   tcp_hdr->th_flags = TH_SYN;
-  tcp_hdr->th_win = ntohs(0xFAF0);
+  tcp_hdr->th_win = ntohs(512);
   tcp_hdr->th_seq = ntohl(0x10101010);
 
   // the rest of it...
@@ -790,7 +945,7 @@ static void inner_main_loop(struct xsk_socket_info *xsk) {
   uint32_t idx_rx = 0, idx_fq = 0;
   int ret;
 
-  init_tcp(xsk);
+  tcp_init(xsk);
 
   rcvd = xsk_ring_cons__peek(&xsk->rx, RX_BATCH_SIZE, &idx_rx);
   if (!rcvd) {
