@@ -37,6 +37,7 @@ static bool global_exit;
 static bool handle_recv(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len) {
     printf("handle_recv\n");
     bool is_ok = false;
+
     is_ok = icmp6_process(xsk, addr, len);
     if (is_ok) {
         return true;
@@ -52,10 +53,10 @@ static bool handle_recv(struct xsk_socket_info *xsk, uint64_t addr, uint32_t len
         return true;
     }
 
-    // is_ok = tcp_process(xsk, addr, len);
-    // if (is_ok) {
-    //     return true;
-    // }
+    is_ok = tcp_process(xsk, addr, len);
+    if (is_ok) {
+        return true;
+    }
 
     uint8_t *pkt = xsk_umem__get_data(xsk->umem->buffer, addr);
     struct ethhdr *eth = (struct ethhdr *)pkt;

@@ -61,14 +61,21 @@ struct packed_tcp_hdr {
 } __attribute__((packed));
 static_assert(sizeof(struct packed_tcp_hdr) == 20, "TCP header is 20 bytes");
 
-static int packed_tcp_hdr_get_offset(const struct packed_tcp_hdr *s) {
+// Return the number of words (4 bytes) that this header occupy.
+static int packed_tcp_hdr_get_offset(const struct packed_tcp_hdr *tcp_hdr) {
     // assert(s->doff___ != 0);
-    return s->doff___ & 0xF0;
+    return (tcp_hdr->doff___ & 0xF0) >> 4;
 }
-static void packed_tcp_hdr_set_offset(struct packed_tcp_hdr *s, uint8_t offset) {
+
+static void packed_tcp_hdr_set_offset(struct packed_tcp_hdr *tcp_hdr, uint8_t offset) {
     assert(offset != 0);
-    s->doff___ = (offset & 0x0F) << 4;
-    assert(s->doff___ != 0);
+    tcp_hdr->doff___ = (offset & 0x0F) << 4;
+    assert(tcp_hdr->doff___ != 0);
+}
+
+static int packed_tcp_hdr_get_data_len(const struct packed_ipv4_hdr *ipv4_hdr, const struct packed_tcp_hdr *tcp_hdr) {
+    const int result = ntohs(ipv4_hdr->tot_len) - (sizeof(struct packed_ipv4_hdr)) - (packed_tcp_hdr_get_offset(tcp_hdr) * 4);
+    return result;
 }
 
 struct packed_arp_hdr {

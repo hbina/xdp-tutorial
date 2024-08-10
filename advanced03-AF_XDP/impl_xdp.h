@@ -51,8 +51,6 @@
 #define RX_BATCH_SIZE 64
 #define INVALID_UMEM_FRAME UINT64_MAX
 
-
-
 static struct xdp_program *prog;
 int xsk_map_fd;
 bool custom_xsk = false;
@@ -176,13 +174,16 @@ error_exit:
 }
 
 static void complete_tx(struct xsk_socket_info *xsk) {
+    printf("complete_tx\n");
     unsigned int completed;
     uint32_t idx_cq;
 
     if (!xsk->outstanding_tx) {
+        printf("complete_tx: There's no outstanding frame to send out\n");
         return;
     }
 
+    printf("complete_tx: Sending %u frames\n", xsk->outstanding_tx);
     sendto(xsk_socket__fd(xsk->xsk), NULL, 0, MSG_DONTWAIT, NULL, 0);
 
     /* Collect/free completed TX buffers */
